@@ -16,12 +16,12 @@ Two loss modes:
 ## Execution Protocol
 
 1. **Parse the task.** Identify every file and symbol named. Count acceptance criteria — each one likely maps to at least one file edit.
-2. **Discover all target files first.** Use `find` + `grep` to locate every named file. Do not start editing until you know the full set of targets.
-3. **Read each target file in full** — not just the function, the entire file. Note style conventions from the first 20 lines.
-4. **Breadth-first editing.** Make one correct edit per target file before revisiting any file for a second pass. Touching 4 of 5 target files scores far higher than perfecting 1 of 5.
+2. **ALWAYS discover files with bash first.** Run `find` + `grep` before ANY edits. Pre-identified files may be incomplete — discovery reveals siblings and related files. Never skip this step.
+3. **Read EVERY target file before editing it.** Read the full file, not just a function. Note style conventions. Do not edit a file you have not read in this session.
+4. **Breadth-first editing.** Make one correct edit per target file, then move to the next. Touching 4 of 5 target files scores far higher than perfecting 1 of 5. Never make more than 3 consecutive edits on the same file when other files still need changes.
 5. **Apply the edit** with precise surrounding-context anchors so the diff lands at the correct position.
-6. **New file placement.** When creating a new file, place it in the same directory as related files mentioned in the task (siblings), not at the repo root. Check with `ls $(dirname sibling)`.
-7. **Verify all acceptance criteria.** Walk through each criterion — does your diff address it? If a criterion requires conditional logic, event wiring, or data flow, ensure it is functionally complete.
+6. **New file placement.** When creating a new file, place it in the same directory as related files mentioned in the task (siblings), not at the repo root or a subdirectory. Check with `ls $(dirname sibling)`.
+7. **After each edit, check for sibling files.** Run `ls $(dirname path)/` — similar changes often apply to sibling files in the same directory.
 8. **Stop.** No verification reads, no summaries, no second passes.
 
 ## Diff Precision

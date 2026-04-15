@@ -183,17 +183,80 @@ async function runLoop(
 	let finalNudgeSent = false;
 	const pathsAlreadyRead = new Set<string>();
 	const pathReadCounts = new Map<string, number>();
-	let rereadNudgeSent = false;
+	let lastRereadNudgeAt = 0;
 	const editedPaths = new Set<string>();
+	const pathEditCounts = new Map<string, number>();
+	let consecutiveEditsOnSameFile = 0;
+	let lastEditedFile = "";
 
 	let workPhase: "search" | "absorb" | "apply" = "search";
 	let foundFiles: string[] = [];
 	let absorbedFiles = new Set<string>();
+
+	// Parse expected files from system prompt discovery sections
+	const parseExpectedFiles = (text: string): string[] => {
+		const files: string[] = [];
+		const seen = new Set<string>();
+		const sectionPatterns = [
+			/FILES EXPLICITLY NAMED IN THE TASK[^\n]*\n((?:[-*]\s+\S[^\n]*\n)+)/,
+			/LIKELY RELEVANT FILES[^\n]*\n((?:[-*]\s+\S[^\n]*\n)+)/,
+			/Pre-identified target files[^\n]*\n((?:[-*]\s+\S[^\n]*\n)+)/,
+		];
+		for (const re of sectionPatterns) {
+			const match = text.match(re);
+			if (!match) continue;
+			const lineRe = /^[-*]\s+(\S[^(]*?)(?:\s+\(|\s*$)/gm;
+			let m: RegExpExecArray | null;
+			while ((m = lineRe.exec(match[1])) !== null) {
+				const file = m[1].trim();
+				if (file && !seen.has(file)) { seen.add(file); files.push(file); }
+			}
+		}
+		return files;
+	};
+
+	// Extract expected files from system prompt or initial messages
+	const systemPromptText = (currentContext as any).systemPrompt || "";
+	let expectedFiles: string[] = parseExpectedFiles(systemPromptText);
+	if (expectedFiles.length === 0) {
+		for (const msg of currentContext.messages) {
+			if (!("content" in msg) || !Array.isArray(msg.content)) continue;
+			for (const block of msg.content as any[]) {
+				if (block?.type === "text" && typeof block.text === "string") {
+					const parsed = parseExpectedFiles(block.text);
+					if (parsed.length > 0) { expectedFiles = parsed; break; }
+				}
+			}
+			if (expectedFiles.length > 0) break;
+		}
+	}
+	if (expectedFiles.length > 0) {
+		foundFiles = [...expectedFiles];
+		workPhase = "absorb";
+	}
+	let coverageRetries = 0;
+	const MAX_COVERAGE_RETRIES = 2;
+
+	const missingExpectedFiles = (): string[] => {
+		if (expectedFiles.length === 0) return [];
+		const missing: string[] = [];
+		for (const f of expectedFiles) {
+			const norm = f.replace(/^\.\//, "");
+			let touched = false;
+			for (const e of editedPaths) {
+				const en = e.replace(/^\.\//, "");
+				if (en === norm || en.endsWith("/" + norm) || norm.endsWith("/" + en)) { touched = true; break; }
+			}
+			if (!touched) missing.push(f);
+		}
+		return missing;
+	};
 	const EARLY_NUDGE_MS = 10_000;
 	const URGENT_NUDGE_MS = 22_000;
 	const LATE_NUDGE_MS = 55_000;
 	const GRACEFUL_EXIT_MS = 170_000;
 	let multiFileHintSent = false;
+	let reviewPassDone = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -251,6 +314,12 @@ async function runLoop(
 			}
 
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			// Gemini sometimes hallucinates "EditEdits" or "editEdits" instead of "edit"
+			for (const tc of toolCalls) {
+				if (tc.name === "EditEdits" || tc.name === "editEdits") {
+					(tc as { name: string }).name = "edit";
+				}
+			}
 			hasMoreToolCalls = toolCalls.length > 0;
 
 			if (!hasMoreToolCalls && emptyTurnRetries < EMPTY_TURN_MAX) {
@@ -271,6 +340,23 @@ async function runLoop(
 						],
 						timestamp: Date.now(),
 					});
+					continue;
+				}
+			}
+
+			// Forced coverage: model about to stop with edits but expected files still untouched
+			if (!hasMoreToolCalls && hasProducedEdit && coverageRetries < MAX_COVERAGE_RETRIES) {
+				const missing = missingExpectedFiles();
+				if (missing.length > 0) {
+					coverageRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					const list = missing.slice(0, 5).map((f) => `\`${f}\``).join(", ");
+					pendingMessages.push({
+						role: "user",
+						content: [{ type: "text", text: `Before stopping: these discovered target files have NOT been edited yet: ${list}. Read each and decide if it needs a change. Missing a required file forfeits all matched lines for it.` }],
+						timestamp: Date.now(),
+					});
+					hasMoreToolCalls = false;
 					continue;
 				}
 			}
@@ -319,19 +405,35 @@ async function runLoop(
 						const firstEdit = !hasProducedEdit;
 						hasProducedEdit = true;
 						explorationCount = 0;
+						const normTarget = targetPath.replace(/^\.\//, "");
 						editedPaths.add(targetPath);
+						editedPaths.add(normTarget);
+						editedPaths.add("./" + normTarget);
+						pathEditCounts.set(normTarget, (pathEditCounts.get(normTarget) ?? 0) + 1);
+						if (normTarget === lastEditedFile) {
+							consecutiveEditsOnSameFile++;
+						} else {
+							consecutiveEditsOnSameFile = 1;
+							lastEditedFile = normTarget;
+						}
 						const uneditedTargets = foundFiles.filter(
-							(f: string) => !editedPaths.has(f) && !editedPaths.has("./" + f) && !editedPaths.has(f.replace(/^\.\//, ""))
+							(f: string) => {
+								const nf = f.replace(/^\.\//, "");
+								return !editedPaths.has(f) && !editedPaths.has(nf) && !editedPaths.has("./" + nf);
+							}
 						);
-						const breadthHint = uneditedTargets.length > 0
-							? ` There are still ${uneditedTargets.length} discovered target file(s) you have not edited: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Continue with the next file.`
-							: "";
+						let breadthHint = "";
+						if (consecutiveEditsOnSameFile >= 3 && uneditedTargets.length > 0) {
+							breadthHint = ` STOP editing \`${normTarget}\` — you have made ${consecutiveEditsOnSameFile} consecutive edits on it. ${uneditedTargets.length} file(s) still need ANY edit: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Move to the next file NOW. One edit per file scores far higher than many edits on one file.`;
+						} else if (uneditedTargets.length > 0) {
+							breadthHint = ` ${uneditedTargets.length} target file(s) still need edits: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Move to the next unedited file — breadth across files scores higher than depth in one file.`;
+						}
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `\`${targetPath}\` updated successfully.${breadthHint} Does this change fully satisfy the relevant acceptance criterion?`,
+									text: `\`${targetPath}\` updated successfully.${breadthHint}`,
 								},
 							],
 							timestamp: Date.now(),
@@ -421,19 +523,22 @@ async function runLoop(
 					}
 				}
 
-				if (!rereadNudgeSent && pendingMessages.length === 0) {
+				const now = Date.now();
+				if (now - lastRereadNudgeAt >= 5_000 && pendingMessages.length === 0) {
 					for (const [rp, cnt] of pathReadCounts) {
-						if (cnt >= 4) {
-							rereadNudgeSent = true;
-							const others = foundFiles.filter(
-								(f: string) => !editedPaths.has(f) && f !== rp && !f.endsWith("/" + rp) && !rp.endsWith("/" + f)
-							);
+						if (cnt >= 3) {
+							lastRereadNudgeAt = now;
+							const normRp = rp.replace(/^\.\//, "");
+							const others = foundFiles.filter((f: string) => {
+								const normF = f.replace(/^\.\//, "");
+								return normF !== normRp && !editedPaths.has(f) && !editedPaths.has(normF) && !editedPaths.has("./" + normF);
+							});
 							pendingMessages.push({
 								role: "user",
 								content: [
 									{
 										type: "text",
-										text: `You have read \`${rp}\` ${cnt} times. Stop re-reading it. ${others.length > 0 ? `Move to a different file you have not edited yet: ${others.slice(0, 4).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` now or move on."}`,
+										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` on a different file or stop."}`,
 									},
 								],
 								timestamp: Date.now(),
@@ -443,7 +548,7 @@ async function runLoop(
 					}
 				}
 
-				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 8));
+				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 6));
 				if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
 					pendingMessages.push({
 						role: "user",
@@ -490,6 +595,25 @@ async function runLoop(
 					}
 				}
 
+				if (hasProducedEdit && pendingMessages.length === 0) {
+					const elapsed = Date.now() - loopStart;
+					const uniqueEdited = new Set([...editedPaths].map(p => p.replace(/^\.\//, "")));
+					const uneditedFound = foundFiles.filter((f: string) => {
+						const nf = f.replace(/^\.\//, "");
+						return !uniqueEdited.has(nf);
+					});
+					if (uneditedFound.length > 0 && elapsed > 30_000 && uniqueEdited.size <= 2) {
+						pendingMessages.push({
+							role: "user",
+							content: [{
+								type: "text",
+								text: `30s+ elapsed and you have only edited ${uniqueEdited.size} file(s). ${uneditedFound.length} discovered target(s) remain: ${uneditedFound.slice(0, 8).map((f: string) => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.`,
+							}],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
 				if ((Date.now() - loopStart) >= GRACEFUL_EXIT_MS) {
 					await emit({ type: "turn_end", message, toolResults });
 					await emit({ type: "agent_end", messages: newMessages });
@@ -524,8 +648,29 @@ async function runLoop(
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// Review pass: if finished quickly and edits were made, check for missed files
+		const reviewElapsed = Date.now() - loopStart;
+		if (!reviewPassDone && hasProducedEdit && reviewElapsed < 60_000) {
+			reviewPassDone = true;
+			workPhase = "search";
+			const uneditedTargets = foundFiles.filter(
+				(f: string) => {
+					const nf = f.replace(/^\.\//, "");
+					return !editedPaths.has(f) && !editedPaths.has(nf) && !editedPaths.has("./" + nf);
+				}
+			);
+			const hint = uneditedTargets.length > 0
+				? `Unedited discovered files: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Read and edit them.`
+				: `Re-read the task acceptance criteria. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
+			pendingMessages = [{
+				role: "user",
+				content: [{ type: "text", text: `REVIEW: You edited ${editedPaths.size} file(s): ${[...editedPaths].slice(0, 8).join(", ")}. ${hint}` }],
+				timestamp: Date.now(),
+			}];
 			continue;
 		}
 
